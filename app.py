@@ -1,5 +1,4 @@
 import os
-import io
 import folium
 import streamlit as st
 import pandas as pd
@@ -9,7 +8,10 @@ from openmeteo_client import OpenMeteoClient
 st.set_page_config(page_title="Nautical Weather Map", page_icon="🌊", layout="wide")
 
 st.title("🌊 Nautical Weather Map — Open-Meteo")
-st.caption("Enter one position/time or upload many, then visualize wind, **Significant wave (Hs)**, **Wind wave**, swell, and currents on a nautical chart. Data source: Open-Meteo Marine API.")
+st.caption(
+    "Enter one position/time or upload many, then visualize wind, Significant wave (Hs), "
+    "Wind wave, swell, and currents on a nautical chart. Data source: Open-Meteo Marine API."
+)
 
 with st.sidebar:
     st.header("Settings")
@@ -34,9 +36,9 @@ with tab_single:
     with c1:
         ts = st.text_input("Timestamp (UTC) e.g., `2025-09-20 06:30` or ISO", value="2025-09-20 06:00")
     with c2:
-        lat = st.number_input("Latitude", value=0.0, format="%.6f")
+        lat = st.number_input("Latitude", value=40.0, format="%.6f")
     with c3:
-        lon = st.number_input("Longitude", value=0.0, format="%.6f")
+        lon = st.number_input("Longitude", value=-40.0, format="%.6f")
     do_single = st.button("Fetch single point")
 
 with tab_bulk:
@@ -51,10 +53,10 @@ def _fetch_one(_lat, _lon, _ts_iso, _api_key):
         return None
     try:
         payload = client_local.fetch_point(float(_lat), float(_lon), parsed.to_pydatetime())
-        values = client_local.extract_values(payload)
-        # Attach back what we asked for
+        requested_iso = payload.get("_requested_iso")
+        values = client_local.extract_values(payload, requested_iso=requested_iso)
         values = values or {}
-        values["requested_iso"] = parsed.isoformat()
+        values["requested_iso"] = requested_iso
         values["req_lat"] = float(_lat)
         values["req_lon"] = float(_lon)
         return values
