@@ -2,15 +2,17 @@ import os
 import folium
 import streamlit as st
 import pandas as pd
+
+# Show client version if available (helps confirm reloads)
 import openmeteo_client as omc
-from utils import to_knots, normalize_input_df, wind_color
 from openmeteo_client import OpenMeteoClient
+from utils import to_knots, normalize_input_df, wind_color
 
 st.set_page_config(page_title="Nautical Weather Map", page_icon="🌊", layout="wide")
 
 st.title("🌊 Nautical Weather Map — Open-Meteo")
 st.caption(
-    f"Client v{getattr(omc, '__CLIENT_VERSION__', '1')} · Enter one position/time or upload many, then visualize wind, "
+    f"Client v{getattr(omc, '__CLIENT_VERSION__', 'unknown')} · Enter one position/time or upload many, then visualize wind, "
     "Significant wave (Hs), Wind wave, swell, and currents on a nautical chart. Data source: Open-Meteo (Forecast / Marine / Ocean)."
 )
 
@@ -24,12 +26,13 @@ with st.sidebar:
     st.write("Add your API key in **Secrets** as `OPENMETEO_API_KEY` (optional). Free tier works without a key.")
 
 api_key = st.secrets.get("OPENMETEO_API_KEY") or os.getenv("OPENMETEO_API_KEY")
-if not api_key:
-    st.info("No Open-Meteo API key found. Using free tier without a key.", icon="ℹ️")
-
 debug = st.sidebar.checkbox("Debug API params to logs", value=False)
 
-client = OpenMeteoClient(api_key=api_key or None, debug=debug)
+# --- Create client safely (works with or without debug kwarg) ---
+try:
+    client = OpenMeteoClient(api_key=api_key or None, debug=debug)
+except TypeError:
+    client = OpenMeteoClient(api_key=api_key or None)
 
 st.subheader("1) Input positions & timestamps")
 tab_single, tab_bulk = st.tabs(["Single point", "Bulk upload CSV/XLSX"])
@@ -48,8 +51,15 @@ with tab_bulk:
     uploaded = st.file_uploader("Upload CSV/XLSX with columns: timestamp, lat, lon", type=["csv","xlsx"])
     do_bulk = st.button("Fetch uploaded points")
 
+def _safe_client(_api_key):
+    try:
+        return OpenMeteoClient(api_key=_api_key or None, debug=debug)
+    except TypeError:
+        return OpenMeteoClient(api_key=_api_key or None)
+
 def _fetch_one(_lat, _lon, _ts_iso, _api_key):
-    client_local = OpenMeteoClient(api_key=_api_key or None, debug=debug)
+    """Fetch a single point and return merged values"""
+    client_local = _safe_client(_api_key)
     parsed = pd.to_datetime(_ts_iso, utc=True, errors="coerce")
     if pd.isna(parsed):
         return None
@@ -81,11 +91,13 @@ def enrich_df(df_in: pd.DataFrame):
         rows.append(rec)
     out = pd.DataFrame(rows)
 
+    # Convert speeds to knots
     if "windSpeed" in out:
         out["windSpeed_kt"] = out["windSpeed"].apply(to_knots)
     if "currentSpeed" in out:
         out["currentSpeed_kt"] = out["currentSpeed"].apply(to_knots)
 
+    # Rename for clarity
     rename_map = {
         "windDirection": "windDir_deg_from",
         "waveHeight": "sigWaveHeight_m",
@@ -117,6 +129,7 @@ def make_map(df_points: pd.DataFrame):
     center = [df_points["lat"].mean(), df_points["lon"].mean()]
     m = folium.Map(location=center, zoom_start=3, tiles="OpenStreetMap", control_scale=True)
 
+    # Nautical overlay
     folium.TileLayer(
         tiles="https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
         attr="Map data: © OpenSeaMap contributors",
