@@ -2,9 +2,9 @@ import requests
 from datetime import datetime, timezone
 from dateutil import parser as dtparser
 
-__CLIENT_VERSION__ = "4"  # force Streamlit to reload
+__CLIENT_VERSION__ = "5"  # hard-fenced endpoints, safer debug logging
 
-# Variable families by API:
+# ---- Variable families mapped to their correct endpoints ----
 FORECAST_VARS = {
     "windSpeed": "windspeed_10m",
     "windDirection": "winddirection_10m",
@@ -22,6 +22,7 @@ OCEAN_VARS = {
     "currentDirection": "current_direction",
 }
 
+# ---- Public endpoints only (IGNORES any accidental custom base URLs) ----
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 MARINE_URL   = "https://marine-api.open-meteo.com/v1/marine"
 OCEAN_URL    = "https://ocean-api.open-meteo.com/v1/ocean"
@@ -29,10 +30,12 @@ OCEAN_URL    = "https://ocean-api.open-meteo.com/v1/ocean"
 
 class OpenMeteoClient:
     def __init__(self, api_key: str = None, timeout: int = 20, debug: bool = False):
-        self.api_key = api_key  # optional (ignored by OM)
+        # api_key is optional; Open-Meteo public endpoints do not require it.
+        self.api_key = api_key
         self.timeout = timeout
         self.debug = debug
 
+    # ---------- time helpers ----------
     def nearest_hour(self, dtobj: datetime):
         if dtobj.tzinfo is None:
             dtobj = dtobj.replace(tzinfo=timezone.utc)
@@ -40,16 +43,26 @@ class OpenMeteoClient:
             dtobj = dtobj.astimezone(timezone.utc)
         return dtobj.replace(minute=0, second=0, microsecond=0)
 
+    # ---------- internal HTTP helper ----------
     def _get(self, url: str, params: dict):
+        # Never override url from environment; v5 is hard-fenced.
         if self.api_key:
-            params.setdefault("apikey", self.api_key)  # harmless if not used
-        if self.debug:
-            print(f"DEBUG GET {url}", params)
-        r = requests.get(url, params=params, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+            # Harmless for public endpoints; ignored by OM
+            params.setdefault("apikey", self.api_key)
 
-    def _day_params(self, lat: float, lon: float, day_iso: str, hourly_csv: str):
+        # Build a prepared request so we can log the exact URL
+        req = requests.Request("GET", url, params=params).prepare()
+        if self.debug:
+            print("DEBUG GET", req.url)
+
+        s = requests.Session()
+        resp = s.send(req, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _day_params(self, lat: float, lon: float, day_iso: str, hourly_vars: dict):
+        # Enforce that only supported variables are requested per endpoint
+        hourly_csv = ",".join(hourly_vars.values())
         return {
             "latitude": lat,
             "longitude": lon,
@@ -77,14 +90,17 @@ class OpenMeteoClient:
                 best_dt, best_i = dt, i
         return best_i
 
+    # ---------- public API ----------
     def fetch_point(self, lat: float, lon: float, dtobj: datetime):
+        """Fetch wind (forecast), waves (marine), and currents (ocean) for the day,
+        then select the hour nearest to the requested time."""
         target = self.nearest_hour(dtobj)
         day = target.date().isoformat()
         requested_iso = target.isoformat()
 
-        fc_params = self._day_params(lat, lon, day, ",".join(FORECAST_VARS.values()))
-        ma_params = self._day_params(lat, lon, day, ",".join(MARINE_VARS.values()))
-        oc_params = self._day_params(lat, lon, day, ",".join(OCEAN_VARS.values()))
+        fc_params = self._day_params(lat, lon, day, FORECAST_VARS)
+        ma_params = self._day_params(lat, lon, day, MARINE_VARS)
+        oc_params = self._day_params(lat, lon, day, OCEAN_VARS)
 
         fc_json = ma_json = oc_json = {}
         try:
