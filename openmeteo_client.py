@@ -1,32 +1,14 @@
+
+import math
 import requests
 from datetime import datetime, timezone
 from dateutil import parser as dtparser
 
-__CLIENT_VERSION__ = "5.2"  # knots for wind; safer currents; tz-robust
+__CLIENT_VERSION__ = "5.4"  # dual Ocean request (speed/dir -> fallback to u/v)
 
-# ---- Variable families mapped to their correct endpoints ----
-FORECAST_VARS = {
-    "windSpeed": "windspeed_10m",
-    "windDirection": "winddirection_10m",
-}
-MARINE_VARS = {
-    "waveHeight": "wave_height",
-    "waveDirection": "wave_direction",
-    "swellHeight": "swell_wave_height",
-    "swellDirection": "swell_wave_direction",
-    "windWaveHeight": "wind_wave_height",
-    "windWaveDirection": "wind_wave_direction",
-}
-OCEAN_VARS = {
-    "currentSpeed": "current_speed",       # primary expected key
-    "currentDirection": "current_direction",
-}
-
-# ---- Public endpoints ----
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 MARINE_URL   = "https://marine-api.open-meteo.com/v1/marine"
 OCEAN_URL    = "https://ocean-api.open-meteo.com/v1/ocean"
-
 
 class OpenMeteoClient:
     def __init__(self, api_key: str = None, timeout: int = 20, debug: bool = False):
@@ -34,15 +16,13 @@ class OpenMeteoClient:
         self.timeout = timeout
         self.debug = debug
 
-    # ---------- time helpers ----------
-    def nearest_hour(self, dtobj):
+    def nearest_hour(self, dtobj: datetime):
         if dtobj.tzinfo is None:
             dtobj = dtobj.replace(tzinfo=timezone.utc)
         else:
             dtobj = dtobj.astimezone(timezone.utc)
         return dtobj.replace(minute=0, second=0, microsecond=0)
 
-    # ---------- internal HTTP helper ----------
     def _get(self, url: str, params: dict):
         if self.api_key:
             params.setdefault("apikey", self.api_key)
@@ -50,12 +30,11 @@ class OpenMeteoClient:
         if self.debug:
             print("DEBUG GET", req.url)
         with requests.Session() as s:
-            resp = s.send(req, timeout=self.timeout)
-        resp.raise_for_status()
-        return resp.json()
+            r = s.send(req, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
 
-    def _day_params(self, lat: float, lon: float, day_iso: str, hourly_vars: dict):
-        hourly_csv = ",".join(hourly_vars.values())
+    def _day_params(self, lat: float, lon: float, day_iso: str, hourly_csv: str):
         return {
             "latitude": lat,
             "longitude": lon,
@@ -90,21 +69,30 @@ class OpenMeteoClient:
                 best_dt, best_i = dt, i
         return best_i
 
-    # ---------- public API ----------
-    def fetch_point(self, lat: float, lon: float, dtobj):
-        """Fetch wind (forecast), waves (marine), and currents (ocean) for the day,
-        then select the hour nearest to the requested time."""
+    def _uv_to_speed_dir(self, u, v):
+        try:
+            uu = float(u); vv = float(v)
+        except Exception:
+            return None, None
+        spd = math.hypot(uu, vv)
+        bearing = (math.degrees(math.atan2(uu, vv)) + 360.0) % 360.0
+        return spd, bearing
+
+    def fetch_point(self, lat: float, lon: float, dtobj: datetime):
         target = self.nearest_hour(dtobj)
         day = target.date().isoformat()
         requested_iso = target.isoformat()
 
-        # Wind in **knots** to avoid double conversion downstream
-        fc_params = self._day_params(lat, lon, day, FORECAST_VARS)
+        fc_params = self._day_params(lat, lon, day, "windspeed_10m,winddirection_10m")
         fc_params["windspeed_unit"] = "kn"
 
-        ma_params = self._day_params(lat, lon, day, MARINE_VARS)
+        ma_params = self._day_params(
+            lat, lon, day,
+            "wave_height,wave_direction,swell_wave_height,swell_wave_direction,wind_wave_height,wind_wave_direction"
+        )
 
-        oc_params = self._day_params(lat, lon, day, OCEAN_VARS)
+        oc_params_1 = self._day_params(lat, lon, day, "current_speed,current_direction")
+        oc_params_2 = self._day_params(lat, lon, day, "current_u,current_v")
 
         fc_json = ma_json = oc_json = {}
         try:
@@ -116,70 +104,84 @@ class OpenMeteoClient:
         except Exception as e:
             if self.debug: print("WARN marine fetch:", e)
         try:
-            oc_json = self._get(OCEAN_URL, oc_params)
+            oc_json = self._get(OCEAN_URL, oc_params_1)
+            h = oc_json.get("hourly", {}) if isinstance(oc_json, dict) else {}
+            if not h or ("current_speed" not in h and "current_direction" not in h):
+                raise ValueError("Ocean response missing current_speed/current_direction; retrying u/v")
         except Exception as e:
-            if self.debug: print("WARN ocean fetch:", e)
+            if self.debug: print("INFO ocean retry using u/v:", e)
+            try:
+                oc_json = self._get(OCEAN_URL, oc_params_2)
+            except Exception as e2:
+                if self.debug: print("WARN ocean u/v fetch:", e2)
+                oc_json = {}
 
         return {
             "_requested_iso": requested_iso,
             "_forecast": fc_json,
             "_marine": ma_json,
             "_ocean": oc_json,
-            "_units": {"wind": "kn", "current": "mps"},  # advertise units to the app
+            "_units": {"wind": "kn", "current": "mps"},
         }
 
     def extract_values(self, payload: dict, requested_iso: str = None):
         requested_iso = requested_iso or payload.get("_requested_iso")
         out = {"iso_time": None}
 
-        # Forecast (wind)
         fc = payload.get("_forecast", {}) or {}
         fc_hourly = fc.get("hourly", {})
         fc_times = fc_hourly.get("time", [])
         if fc_times:
             i = self._pick_index(fc_times, requested_iso)
             out["iso_time"] = out["iso_time"] or fc_times[i]
-            for k, v in FORECAST_VARS.items():
-                try:
-                    out[k] = fc_hourly[v][i]
-                except Exception:
-                    out[k] = None
+            out["windSpeed"]     = fc_hourly.get("windspeed_10m",    [None])[i] if "windspeed_10m"    in fc_hourly else None
+            out["windDirection"] = fc_hourly.get("winddirection_10m",[None])[i] if "winddirection_10m" in fc_hourly else None
         else:
-            for k in FORECAST_VARS: out[k] = None
+            out["windSpeed"] = None
+            out["windDirection"] = None
 
-        # Marine (waves)
         ma = payload.get("_marine", {}) or {}
         ma_hourly = ma.get("hourly", {})
         ma_times = ma_hourly.get("time", [])
         if ma_times:
             i = self._pick_index(ma_times, requested_iso)
             out["iso_time"] = out["iso_time"] or ma_times[i]
-            for k, v in MARINE_VARS.items():
-                try:
-                    out[k] = ma_hourly[v][i]
-                except Exception:
-                    out[k] = None
+            def get(h, k):
+                try: return h.get(k, [None])[i]
+                except Exception: return None
+            out["waveHeight"]        = get(ma_hourly, "wave_height")
+            out["waveDirection"]     = get(ma_hourly, "wave_direction")
+            out["swellHeight"]       = get(ma_hourly, "swell_wave_height")
+            out["swellDirection"]    = get(ma_hourly, "swell_wave_direction")
+            out["windWaveHeight"]    = get(ma_hourly, "wind_wave_height")
+            out["windWaveDirection"] = get(ma_hourly, "wind_wave_direction")
         else:
-            for k in MARINE_VARS: out[k] = None
+            for k in ["waveHeight","waveDirection","swellHeight","swellDirection","windWaveHeight","windWaveDirection"]:
+                out[k] = None
 
-        # Ocean (currents) with fallback for 'current' key if 'current_speed' isn't present
         oc = payload.get("_ocean", {}) or {}
         oc_hourly = oc.get("hourly", {})
         oc_times = oc_hourly.get("time", [])
-        # soft alias if provider returns 'current' instead of 'current_speed'
-        if "current" in oc_hourly and "current_speed" not in oc_hourly:
-            oc_hourly["current_speed"] = oc_hourly["current"]
         if oc_times:
             i = self._pick_index(oc_times, requested_iso)
             out["iso_time"] = out["iso_time"] or oc_times[i]
-            try:
-                out["currentSpeed"] = oc_hourly.get("current_speed", [None])[i]
-            except Exception:
-                out["currentSpeed"] = None
-            try:
-                out["currentDirection"] = oc_hourly.get("current_direction", [None])[i]
-            except Exception:
-                out["currentDirection"] = None
+
+            speed = oc_hourly.get("current_speed",     [None])[i] if "current_speed"     in oc_hourly else None
+            direction = oc_hourly.get("current_direction",[None])[i] if "current_direction" in oc_hourly else None
+
+            if speed is None or direction is None:
+                if speed is None and "current" in oc_hourly:
+                    try: speed = oc_hourly["current"][i]
+                    except Exception: pass
+                u = oc_hourly.get("current_u", [None])[i] if "current_u" in oc_hourly else None
+                v = oc_hourly.get("current_v", [None])[i] if "current_v" in oc_hourly else None
+                if (u is not None) and (v is not None):
+                    spd, bear = self._uv_to_speed_dir(u, v)
+                    if speed is None: speed = spd
+                    if direction is None: direction = bear
+
+            out["currentSpeed"] = speed
+            out["currentDirection"] = direction
         else:
             out["currentSpeed"] = None
             out["currentDirection"] = None
