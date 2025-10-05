@@ -2,8 +2,9 @@ import requests
 from datetime import datetime, timezone
 from dateutil import parser as dtparser
 
-__CLIENT_VERSION__ = "5.1"  # timezone-robust _pick_index
+__CLIENT_VERSION__ = "5.2"  # knots for wind; safer currents; tz-robust
 
+# ---- Variable families mapped to their correct endpoints ----
 FORECAST_VARS = {
     "windSpeed": "windspeed_10m",
     "windDirection": "winddirection_10m",
@@ -17,10 +18,11 @@ MARINE_VARS = {
     "windWaveDirection": "wind_wave_direction",
 }
 OCEAN_VARS = {
-    "currentSpeed": "current_speed",
+    "currentSpeed": "current_speed",       # primary expected key
     "currentDirection": "current_direction",
 }
 
+# ---- Public endpoints ----
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 MARINE_URL   = "https://marine-api.open-meteo.com/v1/marine"
 OCEAN_URL    = "https://ocean-api.open-meteo.com/v1/ocean"
@@ -32,13 +34,15 @@ class OpenMeteoClient:
         self.timeout = timeout
         self.debug = debug
 
-    def nearest_hour(self, dtobj: datetime):
+    # ---------- time helpers ----------
+    def nearest_hour(self, dtobj):
         if dtobj.tzinfo is None:
             dtobj = dtobj.replace(tzinfo=timezone.utc)
         else:
             dtobj = dtobj.astimezone(timezone.utc)
         return dtobj.replace(minute=0, second=0, microsecond=0)
 
+    # ---------- internal HTTP helper ----------
     def _get(self, url: str, params: dict):
         if self.api_key:
             params.setdefault("apikey", self.api_key)
@@ -65,7 +69,6 @@ class OpenMeteoClient:
     def _pick_index(self, times, requested_iso: str):
         if not times:
             return 0
-        # Parse requested time, default to UTC-aware
         try:
             t_req = dtparser.isoparse(requested_iso) if requested_iso else None
         except Exception:
@@ -83,18 +86,24 @@ class OpenMeteoClient:
                 continue
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            # both aware now; safe to subtract
             if best_dt is None or abs((dt - t_req).total_seconds()) < abs((best_dt - t_req).total_seconds()):
                 best_dt, best_i = dt, i
         return best_i
 
-    def fetch_point(self, lat: float, lon: float, dtobj: datetime):
+    # ---------- public API ----------
+    def fetch_point(self, lat: float, lon: float, dtobj):
+        """Fetch wind (forecast), waves (marine), and currents (ocean) for the day,
+        then select the hour nearest to the requested time."""
         target = self.nearest_hour(dtobj)
         day = target.date().isoformat()
         requested_iso = target.isoformat()
 
+        # Wind in **knots** to avoid double conversion downstream
         fc_params = self._day_params(lat, lon, day, FORECAST_VARS)
+        fc_params["windspeed_unit"] = "kn"
+
         ma_params = self._day_params(lat, lon, day, MARINE_VARS)
+
         oc_params = self._day_params(lat, lon, day, OCEAN_VARS)
 
         fc_json = ma_json = oc_json = {}
@@ -116,12 +125,14 @@ class OpenMeteoClient:
             "_forecast": fc_json,
             "_marine": ma_json,
             "_ocean": oc_json,
+            "_units": {"wind": "kn", "current": "mps"},  # advertise units to the app
         }
 
     def extract_values(self, payload: dict, requested_iso: str = None):
         requested_iso = requested_iso or payload.get("_requested_iso")
         out = {"iso_time": None}
 
+        # Forecast (wind)
         fc = payload.get("_forecast", {}) or {}
         fc_hourly = fc.get("hourly", {})
         fc_times = fc_hourly.get("time", [])
@@ -136,6 +147,7 @@ class OpenMeteoClient:
         else:
             for k in FORECAST_VARS: out[k] = None
 
+        # Marine (waves)
         ma = payload.get("_marine", {}) or {}
         ma_hourly = ma.get("hourly", {})
         ma_times = ma_hourly.get("time", [])
@@ -150,18 +162,26 @@ class OpenMeteoClient:
         else:
             for k in MARINE_VARS: out[k] = None
 
+        # Ocean (currents) with fallback for 'current' key if 'current_speed' isn't present
         oc = payload.get("_ocean", {}) or {}
         oc_hourly = oc.get("hourly", {})
         oc_times = oc_hourly.get("time", [])
+        # soft alias if provider returns 'current' instead of 'current_speed'
+        if "current" in oc_hourly and "current_speed" not in oc_hourly:
+            oc_hourly["current_speed"] = oc_hourly["current"]
         if oc_times:
             i = self._pick_index(oc_times, requested_iso)
             out["iso_time"] = out["iso_time"] or oc_times[i]
-            for k, v in OCEAN_VARS.items():
-                try:
-                    out[k] = oc_hourly[v][i]
-                except Exception:
-                    out[k] = None
+            try:
+                out["currentSpeed"] = oc_hourly.get("current_speed", [None])[i]
+            except Exception:
+                out["currentSpeed"] = None
+            try:
+                out["currentDirection"] = oc_hourly.get("current_direction", [None])[i]
+            except Exception:
+                out["currentDirection"] = None
         else:
-            for k in OCEAN_VARS: out[k] = None
+            out["currentSpeed"] = None
+            out["currentDirection"] = None
 
         return out
