@@ -2,9 +2,8 @@ import requests
 from datetime import datetime, timezone
 from dateutil import parser as dtparser
 
-__CLIENT_VERSION__ = "5"  # hard-fenced endpoints, safer debug logging
+__CLIENT_VERSION__ = "5.1"  # timezone-robust _pick_index
 
-# ---- Variable families mapped to their correct endpoints ----
 FORECAST_VARS = {
     "windSpeed": "windspeed_10m",
     "windDirection": "winddirection_10m",
@@ -22,7 +21,6 @@ OCEAN_VARS = {
     "currentDirection": "current_direction",
 }
 
-# ---- Public endpoints only (IGNORES any accidental custom base URLs) ----
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 MARINE_URL   = "https://marine-api.open-meteo.com/v1/marine"
 OCEAN_URL    = "https://ocean-api.open-meteo.com/v1/ocean"
@@ -30,12 +28,10 @@ OCEAN_URL    = "https://ocean-api.open-meteo.com/v1/ocean"
 
 class OpenMeteoClient:
     def __init__(self, api_key: str = None, timeout: int = 20, debug: bool = False):
-        # api_key is optional; Open-Meteo public endpoints do not require it.
         self.api_key = api_key
         self.timeout = timeout
         self.debug = debug
 
-    # ---------- time helpers ----------
     def nearest_hour(self, dtobj: datetime):
         if dtobj.tzinfo is None:
             dtobj = dtobj.replace(tzinfo=timezone.utc)
@@ -43,25 +39,18 @@ class OpenMeteoClient:
             dtobj = dtobj.astimezone(timezone.utc)
         return dtobj.replace(minute=0, second=0, microsecond=0)
 
-    # ---------- internal HTTP helper ----------
     def _get(self, url: str, params: dict):
-        # Never override url from environment; v5 is hard-fenced.
         if self.api_key:
-            # Harmless for public endpoints; ignored by OM
             params.setdefault("apikey", self.api_key)
-
-        # Build a prepared request so we can log the exact URL
         req = requests.Request("GET", url, params=params).prepare()
         if self.debug:
             print("DEBUG GET", req.url)
-
-        s = requests.Session()
-        resp = s.send(req, timeout=self.timeout)
+        with requests.Session() as s:
+            resp = s.send(req, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
 
     def _day_params(self, lat: float, lon: float, day_iso: str, hourly_vars: dict):
-        # Enforce that only supported variables are requested per endpoint
         hourly_csv = ",".join(hourly_vars.values())
         return {
             "latitude": lat,
@@ -76,24 +65,30 @@ class OpenMeteoClient:
     def _pick_index(self, times, requested_iso: str):
         if not times:
             return 0
+        # Parse requested time, default to UTC-aware
         try:
-            t_req = dtparser.isoparse(requested_iso)
+            t_req = dtparser.isoparse(requested_iso) if requested_iso else None
         except Exception:
+            t_req = None
+        if t_req is None:
             return 0
+        if t_req.tzinfo is None:
+            t_req = t_req.replace(tzinfo=timezone.utc)
+
         best_i, best_dt = 0, None
         for i, t in enumerate(times):
             try:
                 dt = dtparser.isoparse(t)
             except Exception:
                 continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            # both aware now; safe to subtract
             if best_dt is None or abs((dt - t_req).total_seconds()) < abs((best_dt - t_req).total_seconds()):
                 best_dt, best_i = dt, i
         return best_i
 
-    # ---------- public API ----------
     def fetch_point(self, lat: float, lon: float, dtobj: datetime):
-        """Fetch wind (forecast), waves (marine), and currents (ocean) for the day,
-        then select the hour nearest to the requested time."""
         target = self.nearest_hour(dtobj)
         day = target.date().isoformat()
         requested_iso = target.isoformat()
@@ -127,7 +122,6 @@ class OpenMeteoClient:
         requested_iso = requested_iso or payload.get("_requested_iso")
         out = {"iso_time": None}
 
-        # Forecast (wind)
         fc = payload.get("_forecast", {}) or {}
         fc_hourly = fc.get("hourly", {})
         fc_times = fc_hourly.get("time", [])
@@ -142,7 +136,6 @@ class OpenMeteoClient:
         else:
             for k in FORECAST_VARS: out[k] = None
 
-        # Marine (waves)
         ma = payload.get("_marine", {}) or {}
         ma_hourly = ma.get("hourly", {})
         ma_times = ma_hourly.get("time", [])
@@ -157,7 +150,6 @@ class OpenMeteoClient:
         else:
             for k in MARINE_VARS: out[k] = None
 
-        # Ocean (currents)
         oc = payload.get("_ocean", {}) or {}
         oc_hourly = oc.get("hourly", {})
         oc_times = oc_hourly.get("time", [])
