@@ -2,8 +2,6 @@ import os
 import folium
 import streamlit as st
 import pandas as pd
-
-# Show client version if available (helps confirm reloads)
 import openmeteo_client as omc
 from openmeteo_client import OpenMeteoClient
 from utils import to_knots, normalize_input_df, wind_color
@@ -28,11 +26,13 @@ with st.sidebar:
 api_key = st.secrets.get("OPENMETEO_API_KEY") or os.getenv("OPENMETEO_API_KEY")
 debug = st.sidebar.checkbox("Debug API params to logs", value=False)
 
-# --- Create client safely (works with or without debug kwarg) ---
-try:
-    client = OpenMeteoClient(api_key=api_key or None, debug=debug)
-except TypeError:
-    client = OpenMeteoClient(api_key=api_key or None)
+def _safe_client(_api_key):
+    try:
+        return OpenMeteoClient(api_key=_api_key or None, debug=debug)
+    except TypeError:
+        return OpenMeteoClient(api_key=_api_key or None)
+
+client = _safe_client(api_key)
 
 st.subheader("1) Input positions & timestamps")
 tab_single, tab_bulk = st.tabs(["Single point", "Bulk upload CSV/XLSX"])
@@ -51,14 +51,7 @@ with tab_bulk:
     uploaded = st.file_uploader("Upload CSV/XLSX with columns: timestamp, lat, lon", type=["csv","xlsx"])
     do_bulk = st.button("Fetch uploaded points")
 
-def _safe_client(_api_key):
-    try:
-        return OpenMeteoClient(api_key=_api_key or None, debug=debug)
-    except TypeError:
-        return OpenMeteoClient(api_key=_api_key or None)
-
 def _fetch_one(_lat, _lon, _ts_iso, _api_key):
-    """Fetch a single point and return merged values"""
     client_local = _safe_client(_api_key)
     parsed = pd.to_datetime(_ts_iso, utc=True, errors="coerce")
     if pd.isna(parsed):
@@ -71,6 +64,19 @@ def _fetch_one(_lat, _lon, _ts_iso, _api_key):
         values["requested_iso"] = requested_iso
         values["req_lat"] = float(_lat)
         values["req_lon"] = float(_lon)
+        # ---- units handling ----
+        units = payload.get("_units", {})
+        wind_unit = units.get("wind", "mps")
+        current_unit = units.get("current", "mps")
+        # wind already in knots from client v5.2
+        if "windSpeed" in values:
+            values["windSpeed_kt"] = float(values["windSpeed"]) if values["windSpeed"] is not None else None
+            if wind_unit != "kn" and values["windSpeed_kt"] is not None:
+                # fallback: if not in knots, convert from m/s
+                values["windSpeed_kt"] = to_knots(values["windSpeed_kt"])
+        # currents from ocean are m/s by default
+        if "currentSpeed" in values and values["currentSpeed"] is not None:
+            values["currentSpeed_kt"] = to_knots(values["currentSpeed"]) if current_unit == "mps" else float(values["currentSpeed"])
         return values
     except Exception as e:
         return {"error": str(e), "requested_iso": str(_ts_iso), "req_lat": _lat, "req_lon": _lon}
@@ -90,12 +96,6 @@ def enrich_df(df_in: pd.DataFrame):
         rec.update(res or {})
         rows.append(rec)
     out = pd.DataFrame(rows)
-
-    # Convert speeds to knots
-    if "windSpeed" in out:
-        out["windSpeed_kt"] = out["windSpeed"].apply(to_knots)
-    if "currentSpeed" in out:
-        out["currentSpeed_kt"] = out["currentSpeed"].apply(to_knots)
 
     # Rename for clarity
     rename_map = {
@@ -129,7 +129,6 @@ def make_map(df_points: pd.DataFrame):
     center = [df_points["lat"].mean(), df_points["lon"].mean()]
     m = folium.Map(location=center, zoom_start=3, tiles="OpenStreetMap", control_scale=True)
 
-    # Nautical overlay
     folium.TileLayer(
         tiles="https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
         attr="Map data: © OpenSeaMap contributors",
